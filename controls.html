@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0e3037" />
+    <title>Catan Enhanced — Controls</title>
+  </head>
+  <body class="controls-page">
+    <main class="controller-shell">
+      <header class="controller-header">
+        <div class="brand-lockup"><span class="brand-mark" aria-hidden="true">CE</span><div><p class="eyebrow">Table controller</p><h1>Catan Enhanced</h1></div></div>
+        <div class="controller-connection" aria-live="polite"><span id="connection-dot" class="connection-dot"></span><span id="connection-label">Connecting</span></div>
+      </header>
+
+      <div id="controller-offline" class="controller-notice">Open <strong>/board</strong> on the main display. This controller will connect automatically.</div>
+
+      <section class="controller-card active-player-panel" aria-labelledby="players-title">
+        <div class="section-heading section-heading--inline"><div><p class="section-kicker">Turn</p><h2 id="players-title">Active player</h2></div><button id="edit-players" class="text-button" type="button">Edit players</button></div>
+        <div id="controls-players" class="controller-players"></div>
+      </section>
+
+      <section class="controller-card build-panel" aria-labelledby="build-title">
+        <div class="section-heading"><div><p class="section-kicker">Build freely</p><h2 id="build-title">Place pieces</h2></div><button id="cancel-build" class="text-button" type="button" hidden>Cancel</button></div>
+        <div class="build-grid">
+          <button class="build-action" data-build="town" type="button"><span class="piece-icon piece-icon--town" aria-hidden="true"></span><span><strong>Town</strong><small>1 point</small></span></button>
+          <button class="build-action" data-build="city" type="button"><span class="piece-icon piece-icon--city" aria-hidden="true"></span><span><strong>City</strong><small>Upgrade</small></span></button>
+          <button class="build-action" data-build="road" type="button"><span class="piece-icon piece-icon--road" aria-hidden="true"></span><span><strong>Road</strong><small>On land</small></span></button>
+        </div>
+        <p id="build-status" class="build-status" aria-live="polite">Waiting for the board…</p>
+      </section>
+
+      <section class="controller-card dice-panel" aria-labelledby="dice-title">
+        <div class="section-heading section-heading--inline"><div><p class="section-kicker">Production</p><h2 id="dice-title">Dice total</h2></div><button id="clear-roll" class="dice-clear" type="button" disabled>Clear</button></div>
+        <p id="roll-status" class="roll-status" aria-live="assertive">Choose a roll</p>
+        <div id="dice-keyboard" class="dice-keyboard" aria-label="Dice total">
+          <button type="button" data-roll="2">2</button><button type="button" data-roll="3">3</button><button type="button" data-roll="4">4</button><button type="button" data-roll="5">5</button><button type="button" data-roll="6">6</button><button type="button" data-roll="7" class="dice-keyboard__robber">7</button><button type="button" data-roll="8">8</button><button type="button" data-roll="9">9</button><button type="button" data-roll="10">10</button><button type="button" data-roll="11">11</button><button type="button" data-roll="12">12</button>
+        </div>
+      </section>
+
+      <section class="controller-card board-tools" aria-label="Board tools">
+        <button id="reset-view" class="tool-button" type="button">Reset board view</button><button id="new-board" class="tool-button tool-button--primary" type="button">New island</button><p class="seed">Board <span id="board-seed">—</span></p>
+      </section>
+    </main>
+
+    <dialog id="setup-dialog" class="setup-dialog" aria-labelledby="setup-title">
+      <form id="setup-form" class="setup-card">
+        <div class="setup-card__copy"><p class="eyebrow">Gather the table</p><h2 id="setup-title">Name your voyagers</h2><p>Add two to four players.</p></div>
+        <div id="player-fields" class="player-fields"></div><button id="add-player" class="add-player" type="button">+ Add another player</button>
+        <div class="setup-card__actions"><button id="cancel-setup" class="button button--quiet" type="button">Cancel</button><button class="button" type="submit">Save players</button></div>
+      </form>
+    </dialog>
+    <script type="module" src="/src/controls.ts"></script>
+  </body>
+</html>

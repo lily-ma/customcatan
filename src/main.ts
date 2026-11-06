@@ -1,6 +1,9 @@
 import { Application, Assets, Circle, Container, Graphics, Polygon, Rectangle, Sprite, Text } from 'pixi.js';
 import type { FederatedPointerEvent, Texture } from 'pixi.js';
 import './style.css';
+import { connectRealtime } from './realtime';
+import type { RealtimeClient } from './realtime';
+import type { GameCommand, GameState } from './protocol';
 
 type TerrainKey = 'forest' | 'pasture' | 'fields' | 'hills' | 'mountains' | 'desert';
 type ResourcePortKind = 'wood' | 'wool' | 'grain' | 'brick' | 'ore';
@@ -135,11 +138,49 @@ let routes = new Map<string, Route>();
 let players: Player[] = [];
 let activePlayerIndex = 0;
 let placementMode: PlacementMode = null;
+let lastRoll: number | null = null;
 let robberPlacementPending = false;
 let controlsLocked = false;
+let applyingRemoteState = false;
+let publishQueued = false;
+let realtimeReadyToPublish = false;
+let realtimeClient: RealtimeClient | null = null;
 let sceneTime = 0;
 const oceanMarks: OceanMark[] = [];
 const tweens: Tween[] = [];
+
+function currentGameState(): GameState | null {
+  if (!activeIsland) return null;
+  return {
+    version: 1,
+    island: {
+      version: 2,
+      id: activeIsland.id,
+      hexes: activeIsland.hexes.map((hex) => ({ q: hex.q, r: hex.r, terrain: hex.terrain.key, number: hex.number })),
+      robber: { ...activeIsland.robber },
+    },
+    players: players.map((player) => ({ ...player })),
+    activePlayerIndex,
+    structures: [...structures.values()].map((structure) => ({ ...structure })),
+    routes: [...routes.values()].map((route) => ({ ...route })),
+    placementMode,
+    lastRoll,
+    robberPlacementPending,
+    buildStatus: requireElement('build-status').textContent ?? '',
+    rollStatus: requireElement('roll-status').textContent ?? '',
+  };
+}
+
+function publishState(): void {
+  if (applyingRemoteState || publishQueued || !realtimeReadyToPublish) return;
+  publishQueued = true;
+  queueMicrotask(() => {
+    publishQueued = false;
+    if (!realtimeReadyToPublish || applyingRemoteState) return;
+    const state = currentGameState();
+    if (state) realtimeClient?.send({ type: 'state:update', state });
+  });
+}
 
 function shuffled<T>(values: T[]): T[] {
   const result = [...values];
@@ -238,6 +279,7 @@ function saveIsland(island: Island): void {
   const stored: StoredIsland = { version: 2, id: island.id, hexes: island.hexes.map((hex) => ({ q: hex.q, r: hex.r, terrain: hex.terrain.key, number: hex.number })), robber: island.robber };
   try { localStorage.setItem(ISLAND_CACHE_KEY, JSON.stringify(stored)); }
   catch (error) { console.warn('The island could not be saved.', error); }
+  publishState();
 }
 
 function loadGame(islandId: string): void {
@@ -271,6 +313,7 @@ function saveGame(): void {
   const stored: StoredGame = { version: 2, islandId: activeIsland.id, players, activePlayerIndex, structures: [...structures.values()], routes: [...routes.values()] };
   try { localStorage.setItem(GAME_CACHE_KEY, JSON.stringify(stored)); }
   catch (error) { console.warn('The game could not be saved.', error); }
+  publishState();
 }
 
 function axialToPixel(q: number, r: number): { x: number; y: number } {
@@ -722,16 +765,18 @@ function setRollStatus(message: string, urgent = false): void {
   const status = requireElement('roll-status');
   status.textContent = message;
   status.classList.toggle('roll-status--urgent', urgent);
+  publishState();
 }
 function setBuildStatus(message: string, urgent = false): void {
   const status = requireElement('build-status');
   status.textContent = message;
   status.classList.toggle('build-status--urgent', urgent);
+  publishState();
 }
 function setControlsLocked(locked: boolean): void {
   controlsLocked = locked;
   diceButtons.forEach((button) => { button.disabled = locked; });
-  clearRollButton.disabled = locked || !diceButtons.some((button) => button.getAttribute('aria-pressed') === 'true');
+  clearRollButton.disabled = !diceButtons.some((button) => button.getAttribute('aria-pressed') === 'true');
   newBoardButton.disabled = locked;
   updateActionUi();
 }
@@ -739,6 +784,8 @@ function clearRollHighlights(): void {
   tileViews.forEach((view) => { view.rollHighlight.visible = false; });
   diceButtons.forEach((button) => button.setAttribute('aria-pressed', 'false'));
   clearRollButton.disabled = true;
+  lastRoll = null;
+  publishState();
 }
 
 function beginRobberPlacement(): void {
@@ -754,6 +801,19 @@ function beginRobberPlacement(): void {
     view.tile.cursor = isCurrent ? 'not-allowed' : 'crosshair';
   });
   refreshPlacementTargets();
+}
+
+function cancelRobberPlacement(): void {
+  if (!robberPlacementPending) return;
+  robberPlacementPending = false;
+  tileViews.forEach((view) => {
+    view.placementHighlight.visible = false;
+    view.tile.cursor = 'pointer';
+  });
+  setControlsLocked(false);
+  clearRollHighlights();
+  setRollStatus('Choose a roll');
+  setBuildStatus('Robber move canceled. Choose any piece to keep building.');
 }
 
 function moveRobber(view: TileView): void {
@@ -773,6 +833,7 @@ function moveRobber(view: TileView): void {
 function handleRoll(total: number, button: HTMLButtonElement): void {
   if (robberPlacementPending) return;
   clearRollHighlights();
+  lastRoll = total;
   button.setAttribute('aria-pressed', 'true');
   clearRollButton.disabled = false;
   if (total === 7) { beginRobberPlacement(); return; }
@@ -845,9 +906,8 @@ function renderIsland(island: Island): void {
   updateActionUi();
 }
 
-function replaceIsland(): void {
-  const confirmed = window.confirm('Create a new island? Player names stay, but all pieces on this island will be cleared.');
-  if (!confirmed) return;
+function replaceIsland(skipConfirmation = false): void {
+  if (!skipConfirmation && !window.confirm('Create a new island? Player names stay, but all pieces on this island will be cleared.')) return;
   const island = createIslandState();
   structures.clear(); routes.clear(); activePlayerIndex = 0;
   saveIsland(island);
@@ -886,7 +946,6 @@ function updateScoreboard(): void {
     const playerRoutes = [...routes.values()].filter((route) => route.ownerId === player.id);
     score.title = `${score.textContent} points · ${playerRoutes.length} roads`;
     card.append(dot, name, score);
-    card.addEventListener('click', () => selectActivePlayer(index));
     list.append(card);
   });
   if (players.length === 0) {
@@ -980,21 +1039,27 @@ function openSetup(): void {
   window.setTimeout(() => playerFields.querySelector<HTMLInputElement>('input')?.focus(), 50);
 }
 
+function applyPlayers(nextPlayers: Player[]): void {
+  if (nextPlayers.length < 2 || nextPlayers.length > 4) return;
+  players = nextPlayers.map((player, index) => ({ id: player.id, name: player.name.trim().slice(0, 24), colorIndex: index }));
+  if (players.some((player) => !player.id || !player.name)) return;
+  activePlayerIndex = Math.max(0, Math.min(activePlayerIndex, players.length - 1));
+  const activeIds = new Set(players.map((player) => player.id));
+  structures.forEach((structure, key) => { if (!activeIds.has(structure.ownerId)) structures.delete(key); });
+  routes.forEach((route, key) => { if (!activeIds.has(route.ownerId)) routes.delete(key); });
+  renderAllPieces();
+  if (setupDialog.open) setupDialog.close();
+  saveGame();
+  updateActionUi();
+  setBuildStatus(`${currentPlayer()!.name} is the active builder. Choose any piece.`);
+}
+
 setupForm.addEventListener('submit', (event) => {
   event.preventDefault();
   const rows = Array.from(playerFields.querySelectorAll<HTMLDivElement>('.player-field'));
   const nextPlayers = rows.map((row, index) => ({ id: row.dataset.playerId || makePlayerId(), name: row.querySelector<HTMLInputElement>('input')!.value.trim(), colorIndex: index }));
   if (nextPlayers.some((player) => !player.name)) return;
-  players = nextPlayers;
-  activePlayerIndex = Math.min(activePlayerIndex, players.length - 1);
-  const activeIds = new Set(players.map((player) => player.id));
-  structures.forEach((structure, key) => { if (!activeIds.has(structure.ownerId)) structures.delete(key); });
-  routes.forEach((route, key) => { if (!activeIds.has(route.ownerId)) routes.delete(key); });
-  renderAllPieces();
-  setupDialog.close();
-  saveGame();
-  updateActionUi();
-  setBuildStatus(`${currentPlayer()!.name} is the active builder. Choose any piece.`);
+  applyPlayers(nextPlayers);
 });
 setupDialog.addEventListener('cancel', (event) => { if (!players.length) event.preventDefault(); });
 addPlayerButton.addEventListener('click', () => addPlayerField());
@@ -1011,7 +1076,7 @@ diceButtons.forEach((button) => {
   button.addEventListener('click', () => { const total = Number(button.dataset.roll); if (Number.isInteger(total)) handleRoll(total, button); });
 });
 clearRollButton.addEventListener('click', () => {
-  if (robberPlacementPending) return;
+  if (robberPlacementPending) { cancelRobberPlacement(); return; }
   clearRollHighlights();
   setRollStatus('Choose a roll');
 });
@@ -1049,9 +1114,59 @@ app.canvas.addEventListener('wheel', (event) => {
   board.position.set(pointerX - worldX * nextScale, pointerY - worldY * nextScale); currentScale = nextScale; board.scale.set(currentScale);
 }, { passive: false });
 
-newBoardButton.addEventListener('click', replaceIsland);
+newBoardButton.addEventListener('click', () => replaceIsland());
 requireElement('reset-view').addEventListener('click', resetView);
 new ResizeObserver(() => { layoutOceanMarks(); if (!dragging) resetView(); }).observe(viewport);
+
+function applyRemoteState(state: GameState): void {
+  if (state.version !== 1 || state.island.hexes.length !== 19) return;
+  applyingRemoteState = true;
+  try {
+    players = state.players.map((player) => ({ ...player }));
+    activePlayerIndex = Math.max(0, Math.min(players.length - 1, state.activePlayerIndex));
+    structures = new Map(state.structures.map((structure) => [structure.vertexKey, { ...structure }]));
+    routes = new Map(state.routes.map((route) => [route.edgeKey, { ...route }]));
+    const island: Island = {
+      id: state.island.id,
+      robber: { ...state.island.robber },
+      hexes: state.island.hexes.map((hex) => ({ ...hex, terrain: terrain[hex.terrain] })),
+    };
+    renderIsland(island);
+
+    if (state.lastRoll !== null) {
+      const rollButton = diceButtons.find((button) => Number(button.dataset.roll) === state.lastRoll);
+      if (rollButton && state.lastRoll !== 7) handleRoll(state.lastRoll, rollButton);
+      else if (rollButton) {
+        lastRoll = 7;
+        rollButton.setAttribute('aria-pressed', 'true');
+        clearRollButton.disabled = false;
+        if (state.robberPlacementPending) beginRobberPlacement();
+      }
+    }
+    if (!state.robberPlacementPending && state.placementMode !== null) setPlacementMode(state.placementMode);
+    setBuildStatus(state.buildStatus, state.robberPlacementPending);
+    setRollStatus(state.rollStatus, state.robberPlacementPending);
+    saveIsland(island);
+    saveGame();
+  } finally {
+    applyingRemoteState = false;
+  }
+}
+
+function handleRemoteCommand(command: GameCommand): void {
+  if (command.type === 'players:set') applyPlayers(command.players);
+  else if (command.type === 'player:select') selectActivePlayer(command.index);
+  else if (command.type === 'build:set') {
+    if (placementMode !== command.mode) setPlacementMode(command.mode);
+  } else if (command.type === 'roll:set') {
+    const button = diceButtons.find((candidate) => Number(candidate.dataset.roll) === command.total);
+    if (button) handleRoll(command.total, button);
+  } else if (command.type === 'roll:clear') {
+    if (robberPlacementPending) cancelRobberPlacement();
+    else { clearRollHighlights(); setRollStatus('Choose a roll'); }
+  } else if (command.type === 'island:new') replaceIsland(true);
+  else if (command.type === 'view:reset') resetView();
+}
 
 app.ticker.add((ticker) => {
   const deltaSeconds = ticker.deltaMS / 1000;
@@ -1127,4 +1242,17 @@ const initialIsland = cachedIsland ?? createIslandState();
 if (!cachedIsland) saveIsland(initialIsland);
 loadGame(initialIsland.id);
 renderIsland(initialIsland);
-if (!players.length) openSetup();
+
+realtimeClient = connectRealtime({
+  role: 'board',
+  onConnectionChange(connected) {
+    if (!connected) realtimeReadyToPublish = false;
+    requireElement('connection-dot').classList.toggle('connection-dot--online', connected);
+    requireElement('connection-label').textContent = connected ? 'Server online' : 'Reconnecting';
+  },
+  onMessage(message) {
+    if (message.type === 'state') { applyRemoteState(message.state); realtimeReadyToPublish = true; }
+    else if (message.type === 'state:request') { realtimeReadyToPublish = true; publishState(); }
+    else if (message.type === 'command') handleRemoteCommand(message.command);
+  },
+});
