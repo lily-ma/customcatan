@@ -10,14 +10,14 @@ type ResourcePortKind = 'wood' | 'wool' | 'grain' | 'brick' | 'ore';
 type PortKind = 'general' | ResourcePortKind;
 type StructureKind = 'town' | 'city';
 type RouteKind = 'road';
-type PlacementMode = StructureKind | RouteKind | null;
+type PlacementMode = StructureKind | RouteKind | 'remove' | null;
 type HexCoordinate = { q: number; r: number };
 type Terrain = { key: TerrainKey; name: string; color: number; accent: number };
 type Hex = HexCoordinate & { terrain: Terrain; number: number | null };
 type Island = { id: string; hexes: Hex[]; robber: HexCoordinate };
 type StoredHex = HexCoordinate & { terrain: TerrainKey; number: number | null };
 type StoredIsland = { version: 1 | 2; id: string; hexes: StoredHex[]; robber?: HexCoordinate };
-type Player = { id: string; name: string; colorIndex: number };
+type Player = { id: string; name: string; colorIndex: number; knightsPlayed: number };
 type Structure = { vertexKey: string; ownerId: string; kind: StructureKind };
 type Route = { edgeKey: string; ownerId: string; kind: RouteKind };
 type StoredGame = {
@@ -27,6 +27,8 @@ type StoredGame = {
   activePlayerIndex: number;
   structures: Structure[];
   routes?: Route[];
+  longestRoadHolderId?: string | null;
+  largestArmyHolderId?: string | null;
 };
 
 type TileView = {
@@ -54,6 +56,16 @@ type EdgeView = { edge: Edge; node: Container; marker: Graphics; piece: Containe
 type PortView = { node: Container; baseX: number; baseY: number; outX: number; outY: number; phase: number };
 type WindView = { node: Graphics; baseY: number; speed: number; phase: number };
 type OceanMark = { node: Graphics; xRatio: number; yRatio: number; phase: number; drift: number };
+type FishView = {
+  node: Container;
+  tail: Graphics;
+  startX: number;
+  endX: number;
+  baseY: number;
+  elapsed: number;
+  duration: number;
+  phase: number;
+};
 type Tween = { elapsed: number; duration: number; update: (progress: number) => void };
 
 const HEX_SIZE = 76;
@@ -137,9 +149,14 @@ let structures = new Map<string, Structure>();
 let routes = new Map<string, Route>();
 let players: Player[] = [];
 let activePlayerIndex = 0;
+let longestRoadHolderId: string | null = null;
+let longestRoadLength = 0;
+let largestArmyHolderId: string | null = null;
+let largestArmySize = 0;
 let placementMode: PlacementMode = null;
 let lastRoll: number | null = null;
 let robberPlacementPending = false;
+let robberPlacementSource: 'roll' | 'knight' | null = null;
 let controlsLocked = false;
 let applyingRemoteState = false;
 let publishQueued = false;
@@ -147,6 +164,8 @@ let realtimeReadyToPublish = false;
 let realtimeClient: RealtimeClient | null = null;
 let sceneTime = 0;
 const oceanMarks: OceanMark[] = [];
+const fishViews: FishView[] = [];
+let nextFishAt = 10 + Math.random() * 10;
 const tweens: Tween[] = [];
 
 function currentGameState(): GameState | null {
@@ -163,7 +182,10 @@ function currentGameState(): GameState | null {
     activePlayerIndex,
     structures: [...structures.values()].map((structure) => ({ ...structure })),
     routes: [...routes.values()].map((route) => ({ ...route })),
+    longestRoad: { holderId: longestRoadHolderId, length: longestRoadLength },
+    largestArmy: { holderId: largestArmyHolderId, size: largestArmySize },
     placementMode,
+    placementTargets: getPlacementTargets(),
     lastRoll,
     robberPlacementPending,
     buildStatus: requireElement('build-status').textContent ?? '',
@@ -287,6 +309,10 @@ function loadGame(islandId: string): void {
   structures.clear();
   routes.clear();
   activePlayerIndex = 0;
+  longestRoadHolderId = null;
+  longestRoadLength = 0;
+  largestArmyHolderId = null;
+  largestArmySize = 0;
   try {
     const cached = localStorage.getItem(GAME_CACHE_KEY);
     if (!cached) return;
@@ -294,7 +320,7 @@ function loadGame(islandId: string): void {
     if ((stored.version !== 1 && stored.version !== 2) || stored.islandId !== islandId || !Array.isArray(stored.players) || stored.players.length < 2 || stored.players.length > 4 || !Array.isArray(stored.structures)) return;
     const validPlayers = stored.players.every((player, index) => player && typeof player.id === 'string' && typeof player.name === 'string' && player.name.trim() && player.colorIndex === index);
     if (!validPlayers) return;
-    players = stored.players.map((player) => ({ ...player, name: player.name.trim().slice(0, 24) }));
+    players = stored.players.map((player) => ({ ...player, name: player.name.trim().slice(0, 24), knightsPlayed: Number.isInteger(player.knightsPlayed) ? Math.max(0, player.knightsPlayed) : 0 }));
     const playerIds = new Set(players.map((player) => player.id));
     stored.structures.forEach((structure) => {
       if (structure && typeof structure.vertexKey === 'string' && playerIds.has(structure.ownerId) && (structure.kind === 'town' || structure.kind === 'city')) structures.set(structure.vertexKey, { ...structure });
@@ -305,12 +331,16 @@ function loadGame(islandId: string): void {
       });
     }
     activePlayerIndex = Number.isInteger(stored.activePlayerIndex) ? Math.max(0, Math.min(players.length - 1, stored.activePlayerIndex!)) : 0;
+    longestRoadHolderId = typeof stored.longestRoadHolderId === 'string' && playerIds.has(stored.longestRoadHolderId) ? stored.longestRoadHolderId : null;
+    largestArmyHolderId = typeof stored.largestArmyHolderId === 'string' && playerIds.has(stored.largestArmyHolderId) ? stored.largestArmyHolderId : null;
   } catch (error) { console.warn('The saved game could not be restored.', error); }
 }
 
 function saveGame(): void {
   if (!activeIsland || players.length < 2) return;
-  const stored: StoredGame = { version: 2, islandId: activeIsland.id, players, activePlayerIndex, structures: [...structures.values()], routes: [...routes.values()] };
+  updateLongestRoadAward();
+  updateLargestArmyAward();
+  const stored: StoredGame = { version: 2, islandId: activeIsland.id, players, activePlayerIndex, structures: [...structures.values()], routes: [...routes.values()], longestRoadHolderId, largestArmyHolderId };
   try { localStorage.setItem(GAME_CACHE_KEY, JSON.stringify(stored)); }
   catch (error) { console.warn('The game could not be saved.', error); }
   publishState();
@@ -318,6 +348,23 @@ function saveGame(): void {
 
 function axialToPixel(q: number, r: number): { x: number; y: number } {
   return { x: HEX_SIZE * Math.sqrt(3) * (q + r / 2), y: HEX_SIZE * 1.5 * r };
+}
+
+function drawTinySheep(detail: Graphics, x: number, y: number, scale: number, facing: 1 | -1): void {
+  const headX = x + facing * 7 * scale;
+  detail.ellipse(x + 1.5 * scale, y + 4.5 * scale, 8.5 * scale, 3.2 * scale).fill({ color: 0x304c38, alpha: .24 });
+  detail
+    .moveTo(x - 4 * scale, y + 3 * scale).lineTo(x - 4.5 * scale, y + 8 * scale)
+    .moveTo(x + 3 * scale, y + 3 * scale).lineTo(x + 3.5 * scale, y + 8 * scale)
+    .stroke({ color: 0x36463d, width: Math.max(1, 1.35 * scale), alpha: .9, cap: 'round' });
+  detail
+    .circle(x - 4 * scale, y, 5.3 * scale)
+    .circle(x + 1 * scale, y - 1.2 * scale, 5.8 * scale)
+    .circle(x + 5 * scale, y + .5 * scale, 4.6 * scale)
+    .fill({ color: 0xf8f2df, alpha: .98 })
+    .stroke({ color: 0xd7ddc8, width: Math.max(.7, scale), alpha: .8 });
+  detail.ellipse(headX, y + 1.2 * scale, 3.8 * scale, 4.3 * scale).fill({ color: 0x3c4a40, alpha: .98 });
+  detail.circle(headX + facing * 1.2 * scale, y - .1 * scale, .65 * scale).fill({ color: 0xf9edc9, alpha: .95 });
 }
 
 function drawTerrainDetails(kind: TerrainKey, accent: number): Graphics {
@@ -348,9 +395,13 @@ function drawTerrainDetails(kind: TerrainKey, accent: number): Graphics {
       detail.ellipse(x, y, radius, radius * .62).fill({ color: accent, alpha: .34 });
       detail.ellipse(x - 4, y - 3, radius * .62, radius * .3).fill({ color: 0xe4efb8, alpha: .35 });
     });
-    detail.ellipse(6, 11, 15, 9).fill({ color: 0x48523f, alpha: .25 });
-    detail.circle(2, 6, 9).circle(11, 6, 8).circle(7, 1, 8).fill({ color: 0xf4efd9 });
-    detail.ellipse(17, 7, 6, 5).fill(0x35483a).circle(19, 5, 1.3).fill(0xf4efd9);
+    ([
+      [-40, -21, .72, 1],
+      [39, -19, .67, -1],
+      [-38, 25, .7, -1],
+      [37, 25, .66, 1],
+      [1, -43, .63, 1],
+    ] as const).forEach(([x, y, sheepScale, facing]) => drawTinySheep(detail, x, y, sheepScale, facing));
   } else if (kind === 'hills') {
     [[-31, 4, 31], [9, -10, 38], [40, 19, 25]].forEach(([x, y, radius]) => {
       detail.circle(x + 5, y + 6, radius).fill({ color: 0x5b2c27, alpha: .32 });
@@ -497,9 +548,10 @@ function createVertexView(vertex: Vertex): VertexView {
   node.on('pointerenter', () => { if (marker.visible) marker.scale.set(1.16); });
   node.on('pointerleave', () => marker.scale.set(1));
   node.on('pointertap', (event: FederatedPointerEvent) => {
-    if (moved || (placementMode !== 'town' && placementMode !== 'city') || !marker.visible) return;
+    if (moved || !marker.visible) return;
     event.stopPropagation();
-    placeStructure(vertex.key);
+    if (placementMode === 'remove') removeStructure(vertex.key);
+    else if (placementMode === 'town' || placementMode === 'city') placeStructure(vertex.key);
   });
   return view;
 }
@@ -516,9 +568,10 @@ function createEdgeView(edge: Edge): EdgeView {
   node.on('pointerenter', () => { if (marker.visible) marker.scale.y = 1.28; });
   node.on('pointerleave', () => { marker.scale.y = 1; });
   node.on('pointertap', (event: FederatedPointerEvent) => {
-    if (moved || placementMode !== 'road' || !marker.visible) return;
+    if (moved || !marker.visible) return;
     event.stopPropagation();
-    placeRoute(edge.key);
+    if (placementMode === 'remove') removeRoute(edge.key);
+    else if (placementMode === 'road') placeRoute(edge.key);
   });
   return view;
 }
@@ -629,21 +682,39 @@ function canPlaceRoute(key: string): boolean {
   });
 }
 
+function getPlacementTargets(): NonNullable<GameState['placementTargets']> {
+  const player = currentPlayer();
+  if (!player || placementMode === null) return [];
+  if (placementMode === 'remove') {
+    return [
+      ...[...structures.values()].filter((piece) => piece.ownerId === player.id).map((piece) => ({ type: 'vertex' as const, key: piece.vertexKey })),
+      ...[...routes.values()].filter((route) => route.ownerId === player.id).map((route) => ({ type: 'edge' as const, key: route.edgeKey })),
+    ];
+  }
+  if (placementMode === 'town' || placementMode === 'city') {
+    const structureMode = placementMode;
+    return [...vertices.keys()].filter((key) => canPlaceStructure(key, structureMode)).map((key) => ({ type: 'vertex', key }));
+  }
+  return [...edges.keys()].filter((key) => canPlaceRoute(key)).map((key) => ({ type: 'edge', key }));
+}
+
 function refreshPlacementTargets(): void {
   const player = currentPlayer();
   vertexViews.forEach((view) => {
-    const valid = !!player && (placementMode === 'town' || placementMode === 'city') && canPlaceStructure(view.vertex.key, placementMode);
+    const removable = !!player && placementMode === 'remove' && structures.get(view.vertex.key)?.ownerId === player.id;
+    const valid = removable || (!!player && (placementMode === 'town' || placementMode === 'city') && canPlaceStructure(view.vertex.key, placementMode));
     view.marker.visible = valid;
     view.node.eventMode = valid ? 'static' : 'none';
     view.node.cursor = valid ? 'pointer' : 'default';
-    if (valid) view.marker.tint = playerPalette[player.colorIndex].solid;
+    if (valid) view.marker.tint = removable ? 0xe96d5f : playerPalette[player!.colorIndex].solid;
   });
   edgeViews.forEach((view) => {
-    const valid = !!player && placementMode === 'road' && canPlaceRoute(view.edge.key);
+    const removable = !!player && placementMode === 'remove' && routes.get(view.edge.key)?.ownerId === player.id;
+    const valid = removable || (!!player && placementMode === 'road' && canPlaceRoute(view.edge.key));
     view.marker.visible = valid;
     view.node.eventMode = valid ? 'static' : 'none';
     view.node.cursor = valid ? 'pointer' : 'default';
-    if (valid) view.marker.tint = playerPalette[player.colorIndex].solid;
+    if (valid) view.marker.tint = removable ? 0xe96d5f : playerPalette[player!.colorIndex].solid;
   });
 }
 
@@ -667,6 +738,30 @@ function placeRoute(key: string): void {
   updateScoreboard();
   refreshPlacementTargets();
   setBuildStatus(`${player.name} placed a road. Keep placing or choose another piece.`);
+}
+
+function removeStructure(key: string): void {
+  const player = currentPlayer();
+  const structure = structures.get(key);
+  if (!player || placementMode !== 'remove' || structure?.ownerId !== player.id) return;
+  structures.delete(key);
+  renderStructure(key);
+  saveGame();
+  updateScoreboard();
+  refreshPlacementTargets();
+  setBuildStatus(`${player.name} removed a ${structure.kind}. Select another highlighted piece or cancel.`);
+}
+
+function removeRoute(key: string): void {
+  const player = currentPlayer();
+  const route = routes.get(key);
+  if (!player || placementMode !== 'remove' || route?.ownerId !== player.id) return;
+  routes.delete(key);
+  renderRoute(key);
+  saveGame();
+  updateScoreboard();
+  refreshPlacementTargets();
+  setBuildStatus(`${player.name} removed a road. Select another highlighted piece or cancel.`);
 }
 
 function createPortIcon(kind: ResourcePortKind): Graphics {
@@ -788,12 +883,13 @@ function clearRollHighlights(): void {
   publishState();
 }
 
-function beginRobberPlacement(): void {
+function beginRobberPlacement(source: 'roll' | 'knight' = 'roll'): void {
   if (!activeIsland) return;
   placementMode = null;
   robberPlacementPending = true;
+  robberPlacementSource = source;
   setControlsLocked(true);
-  setRollStatus('7 rolled — move the robber', true);
+  setRollStatus(source === 'knight' ? 'Knight played — move the robber' : '7 rolled — move the robber', true);
   setBuildStatus('Choose a different land hex for the robber.', true);
   tileViews.forEach((view) => {
     const isCurrent = sameCoordinate(view.hex, activeIsland!.robber);
@@ -805,7 +901,13 @@ function beginRobberPlacement(): void {
 
 function cancelRobberPlacement(): void {
   if (!robberPlacementPending) return;
+  const canceledKnightPlayer = robberPlacementSource === 'knight' ? currentPlayer() : null;
   robberPlacementPending = false;
+  robberPlacementSource = null;
+  if (canceledKnightPlayer) {
+    canceledKnightPlayer.knightsPlayed = Math.max(0, canceledKnightPlayer.knightsPlayed - 1);
+    saveGame();
+  }
   tileViews.forEach((view) => {
     view.placementHighlight.visible = false;
     view.tile.cursor = 'pointer';
@@ -821,6 +923,7 @@ function moveRobber(view: TileView): void {
   if (sameCoordinate(view.hex, activeIsland.robber)) { setRollStatus('The robber must move to a different hex', true); return; }
   activeIsland.robber = { q: view.hex.q, r: view.hex.r };
   robberPlacementPending = false;
+  robberPlacementSource = null;
   tileViews.forEach((tileView) => { tileView.placementHighlight.visible = false; tileView.tile.cursor = 'pointer'; });
   updateRobberVisuals();
   saveIsland(activeIsland);
@@ -848,6 +951,7 @@ function renderIsland(island: Island): void {
   tweens.length = 0;
   activeIsland = island;
   robberPlacementPending = false;
+  robberPlacementSource = null;
   placementMode = null;
   board = new Container();
   const waterLayer = new Container();
@@ -909,7 +1013,8 @@ function renderIsland(island: Island): void {
 function replaceIsland(skipConfirmation = false): void {
   if (!skipConfirmation && !window.confirm('Create a new island? Player names stay, but all pieces on this island will be cleared.')) return;
   const island = createIslandState();
-  structures.clear(); routes.clear(); activePlayerIndex = 0;
+  structures.clear(); routes.clear(); activePlayerIndex = 0; longestRoadHolderId = null; longestRoadLength = 0; largestArmyHolderId = null; largestArmySize = 0;
+  players.forEach((player) => { player.knightsPlayed = 0; });
   saveIsland(island);
   renderIsland(island);
   saveGame();
@@ -925,13 +1030,68 @@ function resetView(): void {
   board.position.set(width / 2, height / 2);
 }
 
+function longestRoadFor(playerId: string): number {
+  const playerEdges = [...routes.values()]
+    .filter((route) => route.ownerId === playerId)
+    .map((route) => edges.get(route.edgeKey))
+    .filter((edge): edge is Edge => edge !== undefined);
+  if (playerEdges.length === 0) return 0;
+
+  const incident = new Map<string, Edge[]>();
+  playerEdges.forEach((edge) => {
+    const atA = incident.get(edge.a) ?? []; atA.push(edge); incident.set(edge.a, atA);
+    const atB = incident.get(edge.b) ?? []; atB.push(edge); incident.set(edge.b, atB);
+  });
+
+  const walk = (vertexKey: string, used: Set<string>): number => {
+    const blockingStructure = structures.get(vertexKey);
+    if (used.size > 0 && blockingStructure && blockingStructure.ownerId !== playerId) return used.size;
+    let best = used.size;
+    (incident.get(vertexKey) ?? []).forEach((edge) => {
+      if (used.has(edge.key)) return;
+      used.add(edge.key);
+      best = Math.max(best, walk(edge.a === vertexKey ? edge.b : edge.a, used));
+      used.delete(edge.key);
+    });
+    return best;
+  };
+
+  let longest = 0;
+  incident.forEach((_, vertexKey) => { longest = Math.max(longest, walk(vertexKey, new Set())); });
+  return longest;
+}
+
+function updateLongestRoadAward(): void {
+  const lengths = new Map(players.map((player) => [player.id, longestRoadFor(player.id)]));
+  const maximum = Math.max(0, ...lengths.values());
+  longestRoadLength = maximum;
+  if (maximum < 5) { longestRoadHolderId = null; return; }
+  if (longestRoadHolderId && lengths.get(longestRoadHolderId) === maximum) return;
+  const leaders = players.filter((player) => lengths.get(player.id) === maximum);
+  longestRoadHolderId = leaders.length === 1 ? leaders[0].id : null;
+}
+
+function updateLargestArmyAward(): void {
+  const maximum = Math.max(0, ...players.map((player) => player.knightsPlayed));
+  largestArmySize = maximum;
+  if (maximum < 3) { largestArmyHolderId = null; return; }
+  const currentHolder = players.find((player) => player.id === largestArmyHolderId);
+  if (currentHolder?.knightsPlayed === maximum) return;
+  const leaders = players.filter((player) => player.knightsPlayed === maximum);
+  largestArmyHolderId = leaders.length === 1 ? leaders[0].id : null;
+}
+
 function scoreFor(playerId: string): number {
   let score = 0;
   structures.forEach((structure) => { if (structure.ownerId === playerId) score += structure.kind === 'city' ? 2 : 1; });
+  if (longestRoadHolderId === playerId) score += 2;
+  if (largestArmyHolderId === playerId) score += 2;
   return score;
 }
 
 function updateScoreboard(): void {
+  updateLongestRoadAward();
+  updateLargestArmyAward();
   const list = requireElement('scoreboard-players');
   list.replaceChildren();
   players.forEach((player, index) => {
@@ -941,11 +1101,27 @@ function updateScoreboard(): void {
     card.style.setProperty('--player-color', playerPalette[player.colorIndex].css);
     card.setAttribute('aria-pressed', String(index === activePlayerIndex));
     const dot = document.createElement('span'); dot.className = 'score-card__dot';
+    const identity = document.createElement('span'); identity.className = 'score-card__identity';
+    const nameLine = document.createElement('span'); nameLine.className = 'score-card__name-line';
     const name = document.createElement('span'); name.className = 'score-card__name'; name.textContent = player.name;
+    nameLine.append(name);
+    if (player.id === longestRoadHolderId) {
+      const award = document.createElement('span'); award.className = 'score-card__award score-card__award--road'; award.textContent = '━'; award.title = `Longest Road · ${longestRoadLength} roads · +2 VP`; award.setAttribute('aria-label', award.title);
+      nameLine.append(award);
+    }
+    if (player.id === largestArmyHolderId) {
+      const award = document.createElement('span'); award.className = 'score-card__award score-card__award--army'; award.textContent = '♞'; award.title = `Largest Army · ${largestArmySize} Knights · +2 VP`; award.setAttribute('aria-label', award.title);
+      nameLine.append(award);
+    }
+    const soldiers = document.createElement('span'); soldiers.className = 'score-card__soldiers'; soldiers.setAttribute('aria-label', `${player.knightsPlayed} Knights played`);
+    for (let knight = 0; knight < player.knightsPlayed; knight += 1) {
+      const icon = document.createElement('span'); icon.className = 'score-card__soldier'; icon.textContent = '♟'; icon.setAttribute('aria-hidden', 'true'); soldiers.append(icon);
+    }
+    identity.append(nameLine, soldiers);
     const score = document.createElement('strong'); score.className = 'score-card__score'; score.textContent = String(scoreFor(player.id));
     const playerRoutes = [...routes.values()].filter((route) => route.ownerId === player.id);
-    score.title = `${score.textContent} points · ${playerRoutes.length} roads`;
-    card.append(dot, name, score);
+    score.title = `${score.textContent} points · ${playerRoutes.length} roads · ${player.knightsPlayed} Knights${player.id === longestRoadHolderId ? ` · Longest Road (${longestRoadLength})` : ''}${player.id === largestArmyHolderId ? ` · Largest Army (${largestArmySize})` : ''}`;
+    card.append(dot, identity, score);
     list.append(card);
   });
   if (players.length === 0) {
@@ -959,6 +1135,24 @@ function selectActivePlayer(index: number): void {
   saveGame();
   updateActionUi();
   setBuildStatus(`${players[index].name} is now the active builder.`);
+}
+
+function adjustKnight(playerId: string, delta: 1 | -1): void {
+  const player = players.find((candidate) => candidate.id === playerId);
+  if (!player) return;
+  player.knightsPlayed = Math.max(0, player.knightsPlayed + delta);
+  saveGame();
+  updateScoreboard();
+}
+
+function playKnightCard(): void {
+  const player = currentPlayer();
+  if (!player || robberPlacementPending) return;
+  player.knightsPlayed += 1;
+  clearRollHighlights();
+  beginRobberPlacement('knight');
+  saveGame();
+  updateScoreboard();
 }
 
 const buildButtons = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-build]'));
@@ -980,14 +1174,18 @@ function setPlacementMode(mode: PlacementMode): void {
   placementMode = placementMode === mode ? null : mode;
   updateActionUi();
   if (!placementMode) { setBuildStatus('Choose any piece to keep building.'); return; }
+  const player = currentPlayer()!;
   const structureMode = placementMode === 'town' || placementMode === 'city';
-  const available = structureMode
-    ? [...vertices.keys()].filter((key) => canPlaceStructure(key, placementMode as StructureKind)).length
-    : [...edges.keys()].filter((key) => canPlaceRoute(key)).length;
+  const available = placementMode === 'remove'
+    ? [...structures.values()].filter((piece) => piece.ownerId === player.id).length + [...routes.values()].filter((route) => route.ownerId === player.id).length
+    : structureMode
+      ? [...vertices.keys()].filter((key) => canPlaceStructure(key, placementMode as StructureKind)).length
+      : [...edges.keys()].filter((key) => canPlaceRoute(key)).length;
   const messages: Record<Exclude<PlacementMode, null>, string> = {
     town: 'The first two towns may start freely; later towns must connect to your roads.',
     city: 'Choose one of this player’s glowing towns to upgrade.',
     road: 'Roads must connect to your town, city, or road network.',
+    remove: 'Choose one of this player’s red-highlighted towns, cities, or roads to remove.',
   };
   setBuildStatus(available > 0 ? messages[placementMode] : `No available ${placementMode} locations.`, available === 0);
 }
@@ -1002,6 +1200,48 @@ function createOceanMarks(): void {
   }
 }
 function layoutOceanMarks(): void { oceanMarks.forEach((mark) => mark.node.position.set(mark.xRatio * app.screen.width, mark.yRatio * app.screen.height)); }
+
+function spawnFish(): void {
+  const swimsRight = Math.random() >= .5;
+  const scale = .72 + Math.random() * .42;
+  const node = new Container();
+  node.eventMode = 'none';
+  node.alpha = 0;
+  node.scale.set(swimsRight ? scale : -scale, scale);
+
+  const wake = new Graphics()
+    .moveTo(-37, -7).bezierCurveTo(-47, -12, -55, -11, -63, -7).stroke({ color: 0xb9e7df, width: 1.4, alpha: .28, cap: 'round' })
+    .moveTo(-39, 7).bezierCurveTo(-49, 12, -57, 11, -66, 7).stroke({ color: 0xb9e7df, width: 1.2, alpha: .2, cap: 'round' });
+  const shadow = new Graphics().ellipse(-2, 7, 25, 10).fill({ color: 0x052c35, alpha: .3 });
+  const tail = new Graphics()
+    .poly([0, 0, -18, -13, -15, 0, -18, 13], true)
+    .fill({ color: 0xdaa94e, alpha: .9 })
+    .stroke({ color: 0xffe5a3, width: 1.2, alpha: .55, join: 'round' });
+  tail.position.set(-21, 0);
+  const body = new Graphics()
+    .ellipse(0, 0, 27, 14)
+    .fill({ color: 0x62b7ae, alpha: .9 })
+    .stroke({ color: 0xc9eee4, width: 1.5, alpha: .65 })
+    .ellipse(6, -4, 16, 6)
+    .fill({ color: 0xa8dbca, alpha: .3 });
+  const fin = new Graphics()
+    .poly([-3, 4, -14, 16, 8, 8], true)
+    .fill({ color: 0x397d7a, alpha: .75 })
+    .stroke({ color: 0xa9ddd2, width: 1, alpha: .4 });
+  const face = new Graphics()
+    .circle(14, -4, 2.6).fill({ color: 0xf8efd4, alpha: .95 })
+    .circle(14.8, -4, 1.2).fill({ color: 0x0b3238, alpha: .95 })
+    .moveTo(20, 4).quadraticCurveTo(24, 6, 26, 3).stroke({ color: 0x174b51, width: 1.2, alpha: .75, cap: 'round' });
+
+  node.addChild(wake, tail, shadow, body, fin, face);
+  const margin = 90;
+  const startX = swimsRight ? -margin : app.screen.width + margin;
+  const endX = swimsRight ? app.screen.width + margin : -margin;
+  const baseY = app.screen.height * (.18 + Math.random() * .68);
+  node.position.set(startX, baseY);
+  oceanLayer.addChild(node);
+  fishViews.push({ node, tail, startX, endX, baseY, elapsed: 0, duration: 9 + Math.random() * 4, phase: Math.random() * Math.PI * 2 });
+}
 
 const setupDialog = requireElement<HTMLDialogElement>('setup-dialog');
 const setupForm = requireElement<HTMLFormElement>('setup-form');
@@ -1039,9 +1279,15 @@ function openSetup(): void {
   window.setTimeout(() => playerFields.querySelector<HTMLInputElement>('input')?.focus(), 50);
 }
 
-function applyPlayers(nextPlayers: Player[]): void {
+function applyPlayers(nextPlayers: GameState['players']): void {
   if (nextPlayers.length < 2 || nextPlayers.length > 4) return;
-  players = nextPlayers.map((player, index) => ({ id: player.id, name: player.name.trim().slice(0, 24), colorIndex: index }));
+  const existingKnights = new Map(players.map((player) => [player.id, player.knightsPlayed]));
+  players = nextPlayers.map((player, index) => ({
+    id: player.id,
+    name: player.name.trim().slice(0, 24),
+    colorIndex: index,
+    knightsPlayed: Number.isInteger(player.knightsPlayed) ? Math.max(0, player.knightsPlayed ?? 0) : existingKnights.get(player.id) ?? 0,
+  }));
   if (players.some((player) => !player.id || !player.name)) return;
   activePlayerIndex = Math.max(0, Math.min(activePlayerIndex, players.length - 1));
   const activeIds = new Set(players.map((player) => player.id));
@@ -1122,8 +1368,12 @@ function applyRemoteState(state: GameState): void {
   if (state.version !== 1 || state.island.hexes.length !== 19) return;
   applyingRemoteState = true;
   try {
-    players = state.players.map((player) => ({ ...player }));
+    players = state.players.map((player) => ({ ...player, knightsPlayed: Math.max(0, player.knightsPlayed ?? 0) }));
     activePlayerIndex = Math.max(0, Math.min(players.length - 1, state.activePlayerIndex));
+    longestRoadHolderId = state.longestRoad?.holderId ?? null;
+    longestRoadLength = state.longestRoad?.length ?? 0;
+    largestArmyHolderId = state.largestArmy?.holderId ?? null;
+    largestArmySize = state.largestArmy?.size ?? 0;
     structures = new Map(state.structures.map((structure) => [structure.vertexKey, { ...structure }]));
     routes = new Map(state.routes.map((route) => [route.edgeKey, { ...route }]));
     const island: Island = {
@@ -1143,6 +1393,7 @@ function applyRemoteState(state: GameState): void {
         if (state.robberPlacementPending) beginRobberPlacement();
       }
     }
+    if (state.robberPlacementPending && state.lastRoll === null) beginRobberPlacement('knight');
     if (!state.robberPlacementPending && state.placementMode !== null) setPlacementMode(state.placementMode);
     setBuildStatus(state.buildStatus, state.robberPlacementPending);
     setRollStatus(state.rollStatus, state.robberPlacementPending);
@@ -1156,14 +1407,41 @@ function applyRemoteState(state: GameState): void {
 function handleRemoteCommand(command: GameCommand): void {
   if (command.type === 'players:set') applyPlayers(command.players);
   else if (command.type === 'player:select') selectActivePlayer(command.index);
+  else if (command.type === 'knight:adjust') adjustKnight(command.playerId, command.delta);
+  else if (command.type === 'knight:play') playKnightCard();
   else if (command.type === 'build:set') {
     if (placementMode !== command.mode) setPlacementMode(command.mode);
+  } else if (command.type === 'placement:apply') {
+    placementMode = command.mode;
+    updateActionUi();
+    let applied = false;
+    if (command.target.type === 'vertex') {
+      const before = structures.get(command.target.key);
+      if (command.mode === 'remove') removeStructure(command.target.key);
+      else if (command.mode === 'town' || command.mode === 'city') placeStructure(command.target.key);
+      applied = structures.get(command.target.key) !== before;
+    } else if (command.target.type === 'edge') {
+      const before = routes.get(command.target.key);
+      if (command.mode === 'remove') removeRoute(command.target.key);
+      else if (command.mode === 'road') placeRoute(command.target.key);
+      applied = routes.get(command.target.key) !== before;
+    }
+    if (applied) {
+      placementMode = null;
+      updateActionUi();
+      publishState();
+    }
   } else if (command.type === 'roll:set') {
     const button = diceButtons.find((candidate) => Number(candidate.dataset.roll) === command.total);
     if (button) handleRoll(command.total, button);
   } else if (command.type === 'roll:clear') {
     if (robberPlacementPending) cancelRobberPlacement();
     else { clearRollHighlights(); setRollStatus('Choose a roll'); }
+  } else if (command.type === 'robber:move') {
+    const target = tileViews.find((view) => view.hex.q === command.q && view.hex.r === command.r);
+    if (target) moveRobber(target);
+  } else if (command.type === 'robber:cancel') {
+    cancelRobberPlacement();
   } else if (command.type === 'island:new') replaceIsland(true);
   else if (command.type === 'view:reset') resetView();
 }
@@ -1176,6 +1454,25 @@ app.ticker.add((ticker) => {
     mark.node.y = mark.yRatio * app.screen.height + Math.cos(sceneTime * .45 + mark.phase) * 4;
     mark.node.alpha = .45 + Math.sin(sceneTime * .8 + mark.phase) * .22;
   });
+  if (sceneTime >= nextFishAt) {
+    spawnFish();
+    nextFishAt = sceneTime + 10 + Math.random() * 10;
+  }
+  for (let index = fishViews.length - 1; index >= 0; index -= 1) {
+    const fish = fishViews[index];
+    fish.elapsed += deltaSeconds;
+    const progress = Math.min(1, fish.elapsed / fish.duration);
+    fish.node.x = fish.startX + (fish.endX - fish.startX) * progress;
+    fish.node.y = fish.baseY + Math.sin(progress * Math.PI * 3 + fish.phase) * 18;
+    fish.node.rotation = Math.cos(progress * Math.PI * 3 + fish.phase) * .035;
+    fish.tail.rotation = Math.sin(fish.elapsed * 8.5 + fish.phase) * .28;
+    fish.node.alpha = Math.min(1, progress / .12, (1 - progress) / .12) * .72;
+    if (progress >= 1) {
+      oceanLayer.removeChild(fish.node);
+      fish.node.destroy({ children: true });
+      fishViews.splice(index, 1);
+    }
+  }
   waterViews.forEach((view) => {
     view.waves.x = Math.sin(sceneTime * .75 + view.phase) * 4;
     view.waves.y = Math.cos(sceneTime * .58 + view.phase) * 2;
