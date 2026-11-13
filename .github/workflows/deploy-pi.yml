@@ -40,6 +40,9 @@ jobs:
           CATAN_IMAGE: ghcr.io/${{ github.repository }}:latest
         run: docker compose -f compose.pi.yaml up -d --pull always --remove-orphans --wait --wait-timeout 90
 
+      - name: Verify host health endpoint
+        run: curl --fail --silent --show-error http://127.0.0.1:8081/api/health
+
       - name: Show deployed service
         if: always()
         run: docker compose -f compose.pi.yaml ps

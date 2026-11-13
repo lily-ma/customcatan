@@ -39,8 +39,8 @@ not reset an in-progress game.
 
 Once deployed, use:
 
-- `http://192.168.10.201:8080/board`
-- `http://192.168.10.201:8080/controls`
+- `http://192.168.10.201:8081/board`
+- `http://192.168.10.201:8081/controls`
 
 ## Prompt for Codex on the Pi
 
@@ -51,7 +51,7 @@ Use this prompt after creating the GitHub repository and pushing this project:
 > Docker/Git prerequisites, register an ARM64 repository runner with the label
 > `catan-pi`, install it as a service, verify the runner user can run Docker, then
 > manually run the `Deploy to Raspberry Pi` workflow and confirm the health API
-> at `http://127.0.0.1:8080/api/health`. Ask me to supply the short-lived runner
+> at `http://127.0.0.1:8081/api/health`. Ask me to supply the short-lived runner
 > registration token when GitHub generates it; do not store that token in files.
 
 ## Rollback

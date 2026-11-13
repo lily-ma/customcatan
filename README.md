@@ -46,7 +46,7 @@ npm run build
 npm start
 ```
 
-The production server listens on port `8080`. Override its configuration with:
+The production server listens inside the container on port `8080`; the Pi deployment exposes it on host port `8081`. Override its configuration with:
 
 - `PORT`: HTTP and WebSocket port
 - `DATA_DIR`: directory containing the persisted `game-state.json`
@@ -63,7 +63,7 @@ The repository includes GitHub Actions workflows that:
 
 Follow the one-time setup and Codex handoff in
 [docs/PI_DEPLOYMENT.md](docs/PI_DEPLOYMENT.md). Once deployed to the configured
-Pi, the board is available at `http://192.168.10.201:8080/board`.
+Pi, the board is available at `http://192.168.10.201:8081/board`.
 
 ## Project structure
 
