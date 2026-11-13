@@ -28,3 +28,5 @@ The server listens on port `8080` by default. Set `PORT` and `DATA_DIR` to overr
 ## Raspberry Pi
 
 Install Docker Engine and the Compose plugin on the Pi, copy or clone this repository, and run `docker compose up -d --build`. The image uses the official multi-architecture Node Alpine base and can build on 64-bit Raspberry Pi OS.
+
+For automatic GitHub-based deployments, see [docs/PI_DEPLOYMENT.md](docs/PI_DEPLOYMENT.md). The CI/CD workflows build and publish a multi-architecture image, then deploy it through a self-hosted GitHub Actions runner on the Pi.
